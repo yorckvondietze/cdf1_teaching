@@ -503,6 +503,43 @@ def make_elements(kinds, seed=1, cell=10.0, sizes=None):
     return [create_element(kind, rng, cell, sizes) for kind in kinds]
 
 
+def _count_contacts(candidate, boxes, tol=0.001):
+    """Count boxes that touch the candidate with sufficient face overlap."""
+    candidate_extents = tuple(
+        candidate[coordinate + 3] - candidate[coordinate]
+        for coordinate in range(3)
+    )
+    contacts = 0
+    for other in boxes:
+        other_extents = tuple(
+            other[coordinate + 3] - other[coordinate]
+            for coordinate in range(3)
+        )
+        touches = any(
+            (
+                abs(candidate[axis] - other[axis + 3]) <= tol
+                or abs(candidate[axis + 3] - other[axis]) <= tol
+            )
+            and all(
+                min(candidate[coordinate + 3], other[coordinate + 3])
+                - max(candidate[coordinate], other[coordinate])
+                > max(
+                    tol,
+                    0.1 * min(
+                        candidate_extents[coordinate],
+                        other_extents[coordinate],
+                    ),
+                )
+                for coordinate in range(3)
+                if coordinate != axis
+            )
+            for axis in range(3)
+        )
+        if touches:
+            contacts += 1
+    return contacts
+
+
 def assemble_touching(
     elements,
     kinds,
@@ -511,10 +548,13 @@ def assemble_touching(
     frame_width=0.0,
     frame_depth=0.0,
     frame_height=0.0,
-    max_tries=200,
+    min_contacts=2,
+    max_tries=500,
 ):
     """
     Place elements without overlap, touching along one selected axis.
+
+    Each new element must touch at least min_contacts already placed elements.
 
     elements : list of Rhino.Geometry.Brep -- origin-based Breps to place
     kinds : list of str -- kind labels corresponding to elements
@@ -523,10 +563,13 @@ def assemble_touching(
     frame_width : float -- maximum X extent centered on the first element (0 = unlimited)
     frame_depth : float -- maximum Y extent centered on the first element (0 = unlimited)
     frame_height : float -- maximum Z extent centered on the first element (0 = unlimited)
+    min_contacts : int -- minimum number of already placed elements to touch
     max_tries : int -- maximum placement attempts per element
 
     Returns placed Breps and their corresponding kind labels.
     """
+    min_contacts = max(1, int(min_contacts))
+    max_tries = max(1, int(max_tries))
     if elements is None or kinds is None:
         raise ValueError("elements and kinds must be provided.")
     if len(elements) != len(kinds):
@@ -612,6 +655,10 @@ def assemble_touching(
                 for other in placed_boxes
             )
             if not overlaps:
+                contacts = _count_contacts(candidate, placed_boxes)
+                required = min(min_contacts, len(placed_boxes))
+                if contacts < required:
+                    continue
                 moved = move_brep(element, new_min[0], new_min[1], new_min[2])
                 placed.append(moved)
                 placed_kinds.append(kind)
