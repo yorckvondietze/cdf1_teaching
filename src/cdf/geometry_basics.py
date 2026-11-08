@@ -232,7 +232,7 @@ def rotate_brep(brep, center=None, axis=2, angle_degrees=90.0):
     return rotated_brep
 
 
-def random_grid_points(seed=1, nx=6, ny=6, nz=6, cell=10.0, count=20):
+def random_grid_points(seed=1, nx=6, ny=6, nz=6, module=10.0, count=20):
     """
     Create seeded random points at minimum corners of distinct grid cells.
 
@@ -240,7 +240,7 @@ def random_grid_points(seed=1, nx=6, ny=6, nz=6, cell=10.0, count=20):
     nx : int -- number of grid cells along X
     ny : int -- number of grid cells along Y
     nz : int -- number of grid cells along Z
-    cell : float -- size of one grid cell
+    module : float -- base length of the design, all element sizes are multiples of it
     count : int -- number of points to return, capped at the number of cells
 
     Returns a list of Rhino.Geometry.Point3d.
@@ -254,18 +254,18 @@ def random_grid_points(seed=1, nx=6, ny=6, nz=6, cell=10.0, count=20):
     ]
     chosen_cells = rng.sample(cells, min(count, len(cells)))
     return [
-        rg.Point3d(i * cell, j * cell, k * cell)
+        rg.Point3d(i * module, j * module, k * module)
         for i, j, k in chosen_cells
     ]
 
 
-def boxes_at_points(points, seed=1, cell=10.0, max_span=3, slab_share=0.2):
+def boxes_at_points(points, seed=1, module=10.0, max_span=3, slab_share=0.2):
     """
     Create randomly sized boxes at the given points.
 
     points : list of Rhino.Geometry.Point3d -- box minimum corners
     seed : int -- random seed
-    cell : float -- size of one grid cell
+    module : float -- base length of the design, all element sizes are multiples of it
     max_span : int -- maximum box size in grid cells per direction
     slab_share : float -- probability that a box is a thin slab
 
@@ -278,11 +278,11 @@ def boxes_at_points(points, seed=1, cell=10.0, max_span=3, slab_share=0.2):
     boxes = []
     for point in points:
         sizes = [
-            rng.randint(1, max_span) * cell
+            rng.randint(1, max_span) * module
             for _ in range(3)
         ]
         if rng.random() < slab_share:
-            sizes[rng.randrange(3)] = 0.2 * cell
+            sizes[rng.randrange(3)] = 0.2 * module
 
         boxes.append(create_box(point, sizes[0], sizes[1], sizes[2]))
     return boxes
@@ -291,7 +291,7 @@ def boxes_at_points(points, seed=1, cell=10.0, max_span=3, slab_share=0.2):
 def elements_at_points(
     points,
     seed=1,
-    cell=10.0,
+    module=10.0,
     sizes=None,
     bar_share=0.3,
     disc_share=0.2,
@@ -303,7 +303,7 @@ def elements_at_points(
 
     points : list of Rhino.Geometry.Point3d -- minimum box corners
     seed : int -- random seed
-    cell : float -- size of one grid cell
+    module : float -- base length of the design, all element sizes are multiples of it
     sizes : list -- size settings ordered as plate, bar, disc, ring, and ball
     bar_share : float -- probability share for bars
     disc_share : float -- probability share for discs
@@ -332,16 +332,16 @@ def elements_at_points(
         choice = rng.random()
         if choice < bar_share:
             if rng.random() < 0.7:
-                size_x = 0.3 * cell
-                size_z = rng.randint(2, bar_span) * cell
+                size_x = 0.3 * module
+                size_z = rng.randint(2, bar_span) * module
             else:
-                size_x = rng.randint(2, bar_span) * cell
-                size_z = 0.3 * cell
-            element = create_box(point, size_x, 0.3 * cell, size_z)
+                size_x = rng.randint(2, bar_span) * module
+                size_z = 0.3 * module
+            element = create_box(point, size_x, 0.3 * module, size_z)
             kind = "bar"
         elif choice < bar_share + disc_share:
-            radius = rng.randint(1, disc_span) * cell / 2.0
-            height = 0.2 * cell
+            radius = rng.randint(1, disc_span) * module / 2.0
+            height = 0.2 * module
             element = create_cylinder(origin, height, radius)
             element = rotate_brep(element, center=origin, axis=0, angle_degrees=90.0)
             element = move_brep(
@@ -352,8 +352,8 @@ def elements_at_points(
             )
             kind = "disc"
         elif choice < bar_share + disc_share + ring_share:
-            outer_radius = rng.randint(1, ring_span) * cell / 2.0
-            height = 0.2 * cell
+            outer_radius = rng.randint(1, ring_span) * module / 2.0
+            height = 0.2 * module
             element = create_tube(
                 origin, height, outer_radius, 0.6 * outer_radius
             )
@@ -366,7 +366,7 @@ def elements_at_points(
             )
             kind = "ring"
         elif choice < bar_share + disc_share + ring_share + ball_share:
-            radius = rng.uniform(0.5 * ball_size * cell, ball_size * cell)
+            radius = rng.uniform(0.5 * ball_size * module, ball_size * module)
             center = rg.Point3d(
                 point.X + radius,
                 point.Y + radius,
@@ -375,9 +375,9 @@ def elements_at_points(
             element = create_sphere(center, radius)
             kind = "ball"
         else:
-            size_x = rng.randint(1, plate_span) * cell
-            size_z = rng.randint(1, plate_span) * cell
-            element = create_box(point, size_x, 0.2 * cell, size_z)
+            size_x = rng.randint(1, plate_span) * module
+            size_z = rng.randint(1, plate_span) * module
+            element = create_box(point, size_x, 0.2 * module, size_z)
             kind = "plate"
 
         elements.append(element)
@@ -410,13 +410,13 @@ def create_element_sizes(
     return [plate_span, bar_span, disc_span, ring_span, ball_size, slenderness]
 
 
-def create_element(kind, rng, cell=10.0, sizes=None):
+def create_element(kind, rng, module=10.0, sizes=None):
     """
     Create one element with its bounding-box minimum corner at the origin.
 
     kind : str -- element kind: "bar", "disc", "ring", "ball", or "plate"
     rng : random.Random -- random number generator
-    cell : float -- size of one grid cell
+    module : float -- base length of the design, all element sizes are multiples of it
     sizes : list -- settings ordered as plate, bar, disc, ring, ball, and slenderness
                    (sizes[5]: 0 = chunky, 1 = slender)
 
@@ -437,39 +437,39 @@ def create_element(kind, rng, cell=10.0, sizes=None):
 
     if kind == "bar":
         if rng.random() < 0.7:
-            length = rng.randint(2, bar_span) * cell
+            length = rng.randint(2, bar_span) * module
             thickness = rng.uniform(
-                cell * (0.8 - 0.65 * slenderness),
-                cell * (1.6 - 1.15 * slenderness),
+                module * (0.8 - 0.65 * slenderness),
+                module * (1.6 - 1.15 * slenderness),
             )
             return create_box(origin, thickness, thickness, length)
         else:
-            length = rng.randint(2, bar_span) * cell
+            length = rng.randint(2, bar_span) * module
             thickness = rng.uniform(
-                cell * (0.8 - 0.65 * slenderness),
-                cell * (1.6 - 1.15 * slenderness),
+                module * (0.8 - 0.65 * slenderness),
+                module * (1.6 - 1.15 * slenderness),
             )
             return create_box(origin, length, thickness, thickness)
     if kind == "disc":
-        radius = rng.randint(1, disc_span) * cell / 2.0
-        height = cell * (1.0 - 0.8 * slenderness)
+        radius = rng.randint(1, disc_span) * module / 2.0
+        height = module * (1.0 - 0.8 * slenderness)
         element = create_cylinder(origin, height, radius)
         element = rotate_brep(element, center=origin, axis=0, angle_degrees=90.0)
         return move_brep(element, radius, height, radius)
     if kind == "ring":
-        outer_radius = rng.randint(1, ring_span) * cell / 2.0
-        height = cell * (1.0 - 0.8 * slenderness)
+        outer_radius = rng.randint(1, ring_span) * module / 2.0
+        height = module * (1.0 - 0.8 * slenderness)
         element = create_tube(origin, height, outer_radius, 0.6 * outer_radius)
         element = rotate_brep(element, center=origin, axis=0, angle_degrees=90.0)
         return move_brep(element, outer_radius, height, outer_radius)
     if kind == "ball":
-        radius = rng.uniform(0.5 * ball_size * cell, ball_size * cell)
+        radius = rng.uniform(0.5 * ball_size * module, ball_size * module)
         center = rg.Point3d(radius, radius, radius)
         return create_sphere(center, radius)
 
-    size_x = rng.randint(1, plate_span) * cell
-    size_z = rng.randint(1, plate_span) * cell
-    depth = cell * (1.0 - 0.8 * slenderness)
+    size_x = rng.randint(1, plate_span) * module
+    size_z = rng.randint(1, plate_span) * module
+    depth = module * (1.0 - 0.8 * slenderness)
     return create_box(origin, size_x, depth, size_z)
 
 
@@ -504,13 +504,13 @@ def random_kinds(seed=1, count=20, bar_share=0.3, disc_share=0.2, ring_share=0.1
     return kinds
 
 
-def make_elements(kinds, seed=1, cell=10.0, sizes=None):
+def make_elements(kinds, seed=1, module=10.0, sizes=None):
     """
     Create origin-based Breps for the requested element kinds.
 
     kinds : list of str -- element kinds to create
     seed : int -- random seed
-    cell : float -- size of one grid cell
+    module : float -- base length of the design, all element sizes are multiples of it
     sizes : list -- size settings ordered as plate, bar, disc, ring, and ball
 
     Returns a list of Rhino.Geometry.Brep.
@@ -519,7 +519,7 @@ def make_elements(kinds, seed=1, cell=10.0, sizes=None):
         raise ValueError("kinds must be provided.")
 
     rng = random.Random(seed)
-    return [create_element(kind, rng, cell, sizes) for kind in kinds]
+    return [create_element(kind, rng, module, sizes) for kind in kinds]
 
 
 def _make_shape(kind, box):
