@@ -386,7 +386,14 @@ def elements_at_points(
     return elements, kinds
 
 
-def create_element_sizes(plate_span=3, bar_span=5, disc_span=3, ring_span=3, ball_size=0.4):
+def create_element_sizes(
+    plate_span=3,
+    bar_span=5,
+    disc_span=3,
+    ring_span=3,
+    ball_size=0.4,
+    slenderness=0.8,
+):
     """
     Create a list of element size settings.
 
@@ -395,10 +402,12 @@ def create_element_sizes(plate_span=3, bar_span=5, disc_span=3, ring_span=3, bal
     disc_span : int -- disc span
     ring_span : int -- ring span
     ball_size : float -- ball size
+    slenderness : float -- shape from chunky (0) to slender (1)
 
-    Returns the settings in plate, bar, disc, ring, and ball order.
+    Returns the settings in plate, bar, disc, ring, ball, and slenderness order.
     """
-    return [plate_span, bar_span, disc_span, ring_span, ball_size]
+    slenderness = min(1.0, max(0.0, float(slenderness)))
+    return [plate_span, bar_span, disc_span, ring_span, ball_size, slenderness]
 
 
 def create_element(kind, rng, cell=10.0, sizes=None):
@@ -408,7 +417,8 @@ def create_element(kind, rng, cell=10.0, sizes=None):
     kind : str -- element kind: "bar", "disc", "ring", "ball", or "plate"
     rng : random.Random -- random number generator
     cell : float -- size of one grid cell
-    sizes : list -- size settings ordered as plate, bar, disc, ring, and ball
+    sizes : list -- settings ordered as plate, bar, disc, ring, ball, and slenderness
+                   (sizes[5]: 0 = chunky, 1 = slender)
 
     Returns a Rhino.Geometry.Brep.
     """
@@ -422,25 +432,33 @@ def create_element(kind, rng, cell=10.0, sizes=None):
     disc_span = int(sizes[2])
     ring_span = int(sizes[3])
     ball_size = float(sizes[4])
+    slenderness = min(1.0, max(0.0, float(sizes[5]))) if len(sizes) > 5 else 0.8
     origin = rg.Point3d(0, 0, 0)
 
     if kind == "bar":
         if rng.random() < 0.7:
-            size_x = 0.3 * cell
-            size_z = rng.randint(2, bar_span) * cell
+            length = rng.randint(2, bar_span) * cell
+            thickness = rng.uniform(
+                cell * (0.8 - 0.65 * slenderness),
+                cell * (1.6 - 1.15 * slenderness),
+            )
+            return create_box(origin, thickness, thickness, length)
         else:
-            size_x = rng.randint(2, bar_span) * cell
-            size_z = 0.3 * cell
-        return create_box(origin, size_x, 0.3 * cell, size_z)
+            length = rng.randint(2, bar_span) * cell
+            thickness = rng.uniform(
+                cell * (0.8 - 0.65 * slenderness),
+                cell * (1.6 - 1.15 * slenderness),
+            )
+            return create_box(origin, length, thickness, thickness)
     if kind == "disc":
         radius = rng.randint(1, disc_span) * cell / 2.0
-        height = 0.2 * cell
+        height = cell * (1.0 - 0.8 * slenderness)
         element = create_cylinder(origin, height, radius)
         element = rotate_brep(element, center=origin, axis=0, angle_degrees=90.0)
         return move_brep(element, radius, height, radius)
     if kind == "ring":
         outer_radius = rng.randint(1, ring_span) * cell / 2.0
-        height = 0.2 * cell
+        height = cell * (1.0 - 0.8 * slenderness)
         element = create_tube(origin, height, outer_radius, 0.6 * outer_radius)
         element = rotate_brep(element, center=origin, axis=0, angle_degrees=90.0)
         return move_brep(element, outer_radius, height, outer_radius)
@@ -451,7 +469,8 @@ def create_element(kind, rng, cell=10.0, sizes=None):
 
     size_x = rng.randint(1, plate_span) * cell
     size_z = rng.randint(1, plate_span) * cell
-    return create_box(origin, size_x, 0.2 * cell, size_z)
+    depth = cell * (1.0 - 0.8 * slenderness)
+    return create_box(origin, size_x, depth, size_z)
 
 
 def random_kinds(seed=1, count=20, bar_share=0.3, disc_share=0.2, ring_share=0.1, ball_share=0.1):
