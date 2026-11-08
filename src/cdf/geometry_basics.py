@@ -503,38 +503,181 @@ def make_elements(kinds, seed=1, cell=10.0, sizes=None):
     return [create_element(kind, rng, cell, sizes) for kind in kinds]
 
 
-def _count_contacts(candidate, boxes, tol=0.001):
-    """Count boxes that touch the candidate with sufficient face overlap."""
+def _make_shape(kind, box):
+    """
+    Exact analytic shape of a placed element, derived from its kind and bounding box.
+
+    kind : str -- element kind ("bar", "plate", "disc", "ring", "ball")
+    box : tuple -- (min_x, min_y, min_z, max_x, max_y, max_z)
+
+    Returns ("box", x0, y0, z0, x1, y1, z1), ("cyl", cx, cz, radius, y0, y1)
+    (a cylinder whose axis runs along Y) or ("ball", cx, cy, cz, radius).
+    Rings are treated as filled discs.
+    """
+    x0, y0, z0, x1, y1, z1 = box
+    if kind in ("disc", "ring"):
+        radius = min(x1 - x0, z1 - z0) / 2.0
+        return ("cyl", (x0 + x1) / 2.0, (z0 + z1) / 2.0, radius, y0, y1)
+    if kind == "ball":
+        radius = min(x1 - x0, y1 - y0, z1 - z0) / 2.0
+        return ("ball", (x0 + x1) / 2.0, (y0 + y1) / 2.0, (z0 + z1) / 2.0, radius)
+    return ("box", x0, y0, z0, x1, y1, z1)
+
+
+def _point_rect_distance(px, pz, x0, z0, x1, z1):
+    """Distance from a point to a rectangle in the XZ plane (0 inside)."""
+    return math.hypot(max(x0 - px, 0.0, px - x1), max(z0 - pz, 0.0, pz - z1))
+
+
+def _point_shape_distance(px, py, pz, shape):
+    """Distance from a point to a shape. For a ball the value is negative inside."""
+    if shape[0] == "box":
+        dx = max(shape[1] - px, 0.0, px - shape[4])
+        dy = max(shape[2] - py, 0.0, py - shape[5])
+        dz = max(shape[3] - pz, 0.0, pz - shape[6])
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
+    if shape[0] == "cyl":
+        dy = max(shape[4] - py, 0.0, py - shape[5])
+        dr = max(math.hypot(px - shape[1], pz - shape[2]) - shape[3], 0.0)
+        return math.hypot(dy, dr)
+    return math.sqrt(
+        (px - shape[1]) ** 2 + (py - shape[2]) ** 2 + (pz - shape[3]) ** 2
+    ) - shape[4]
+
+
+def _separation(a, b):
+    """
+    Signed separation of two shapes: > 0 gap, 0 touching, < 0 overlapping.
+
+    Boxes and Y-axis cylinders are a Y interval times a region in the XZ plane,
+    so their distance combines the Y gap and the XZ gap exactly. Balls reduce
+    to the distance from the ball center to the other shape minus the radius.
+    """
+    if a[0] == "ball":
+        return _point_shape_distance(a[1], a[2], a[3], b) - a[4]
+    if b[0] == "ball":
+        return _point_shape_distance(b[1], b[2], b[3], a) - b[4]
+
+    ay0, ay1 = (a[2], a[5]) if a[0] == "box" else (a[4], a[5])
+    by0, by1 = (b[2], b[5]) if b[0] == "box" else (b[4], b[5])
+    y_gap = max(ay0 - by1, by0 - ay1)
+
+    if a[0] == "box" and b[0] == "box":
+        gap_x = max(a[1] - b[4], b[1] - a[4])
+        gap_z = max(a[3] - b[6], b[3] - a[6])
+        if gap_x < 0 and gap_z < 0:
+            xz_gap = max(gap_x, gap_z)
+        else:
+            xz_gap = math.hypot(max(gap_x, 0.0), max(gap_z, 0.0))
+    elif a[0] == "cyl" and b[0] == "cyl":
+        xz_gap = math.hypot(a[1] - b[1], a[2] - b[2]) - a[3] - b[3]
+    else:
+        box, cyl = (a, b) if a[0] == "box" else (b, a)
+        xz_gap = _point_rect_distance(
+            cyl[1], cyl[2], box[1], box[3], box[4], box[6]
+        ) - cyl[3]
+
+    if y_gap < 0 and xz_gap < 0:
+        return max(y_gap, xz_gap)
+    return math.hypot(max(y_gap, 0.0), max(xz_gap, 0.0))
+
+
+def _slide_to_contact(kind, box, parent_shape, axis, direction, travel, tol=0.001):
+    """
+    Slide a candidate box along one axis toward its parent until the exact
+    shapes just touch.
+
+    kind : str -- element kind of the candidate
+    box : tuple -- candidate bounding box (min_x, min_y, min_z, max_x, max_y, max_z)
+    parent_shape : tuple -- exact shape of the parent from _make_shape
+    axis : int -- 0 = X, 1 = Y, 2 = Z
+    direction : int -- -1 or +1, the direction toward the parent
+    travel : float -- maximum distance to slide
+
+    Returns the distance to slide, or None if the shapes never touch on this line.
+    """
+    def separation_at(distance):
+        moved = list(box)
+        moved[axis] += direction * distance
+        moved[axis + 3] += direction * distance
+        return _separation(_make_shape(kind, tuple(moved)), parent_shape)
+
+    if separation_at(0.0) <= tol:
+        return 0.0
+
+    # The separation along a line is convex, so a ternary search finds the closest approach.
+    low, high = 0.0, travel
+    for _ in range(30):
+        third = (high - low) / 3.0
+        if separation_at(low + third) < separation_at(high - third):
+            high -= third
+        else:
+            low += third
+    closest = (low + high) / 2.0
+    if separation_at(closest) > tol:
+        return None
+
+    low, high = 0.0, closest
+    for _ in range(30):
+        middle = (low + high) / 2.0
+        if separation_at(middle) > 0.0:
+            low = middle
+        else:
+            high = middle
+    return low
+
+
+def _count_contacts(candidate, shape, boxes, shapes, tol=0.001):
+    """
+    Count placed elements that the candidate touches.
+
+    candidate : tuple -- candidate bounding box
+    shape : tuple -- exact shape of the candidate from _make_shape
+    boxes : list of tuples -- bounding boxes of the placed elements
+    shapes : list of tuples -- exact shapes of the placed elements
+
+    Two boxes touch when their faces meet and overlap enough. If one of the two
+    is round, they touch when the exact distance between the shapes is zero.
+    """
     candidate_extents = tuple(
         candidate[coordinate + 3] - candidate[coordinate]
         for coordinate in range(3)
     )
     contacts = 0
-    for other in boxes:
-        other_extents = tuple(
-            other[coordinate + 3] - other[coordinate]
+    for other, other_shape in zip(boxes, shapes):
+        if not all(
+            candidate[coordinate] <= other[coordinate + 3] + tol
+            and other[coordinate] <= candidate[coordinate + 3] + tol
             for coordinate in range(3)
-        )
-        touches = any(
-            (
-                abs(candidate[axis] - other[axis + 3]) <= tol
-                or abs(candidate[axis + 3] - other[axis]) <= tol
-            )
-            and all(
-                min(candidate[coordinate + 3], other[coordinate + 3])
-                - max(candidate[coordinate], other[coordinate])
-                > max(
-                    tol,
-                    0.1 * min(
-                        candidate_extents[coordinate],
-                        other_extents[coordinate],
-                    ),
-                )
+        ):
+            continue
+        if shape[0] == "box" and other_shape[0] == "box":
+            other_extents = tuple(
+                other[coordinate + 3] - other[coordinate]
                 for coordinate in range(3)
-                if coordinate != axis
             )
-            for axis in range(3)
-        )
+            touches = any(
+                (
+                    abs(candidate[axis] - other[axis + 3]) <= tol
+                    or abs(candidate[axis + 3] - other[axis]) <= tol
+                )
+                and all(
+                    min(candidate[coordinate + 3], other[coordinate + 3])
+                    - max(candidate[coordinate], other[coordinate])
+                    > max(
+                        tol,
+                        0.1 * min(
+                            candidate_extents[coordinate],
+                            other_extents[coordinate],
+                        ),
+                    )
+                    for coordinate in range(3)
+                    if coordinate != axis
+                )
+                for axis in range(3)
+            )
+        else:
+            touches = _separation(shape, other_shape) <= tol
         if touches:
             contacts += 1
     return contacts
@@ -552,9 +695,12 @@ def assemble_touching(
     max_tries=500,
 ):
     """
-    Place elements without overlap, touching along one selected axis.
+    Place elements without overlap, each touching at least min_contacts others.
 
-    Each new element must touch at least min_contacts already placed elements.
+    Boxes are tested by their bounding boxes. Discs, rings and balls are tested
+    as exact shapes (discs and rings as cylinders along Y, balls as spheres), and
+    a new element is slid along its placement axis until it really touches its
+    round parent.
 
     elements : list of Rhino.Geometry.Brep -- origin-based Breps to place
     kinds : list of str -- kind labels corresponding to elements
@@ -589,6 +735,7 @@ def assemble_touching(
     placed = [elements[0]]
     placed_kinds = [kinds[0]]
     placed_boxes = [get_box(elements[0])]
+    placed_shapes = [_make_shape(kinds[0], placed_boxes[0])]
     first_box = placed_boxes[0]
     frame_center = tuple(
         (first_box[coordinate] + first_box[coordinate + 3]) / 2.0
@@ -605,7 +752,9 @@ def assemble_touching(
         )
 
         for _ in range(max_tries):
-            parent = placed_boxes[rng.randrange(len(placed_boxes))]
+            parent_index = rng.randrange(len(placed_boxes))
+            parent = placed_boxes[parent_index]
+            parent_shape = placed_shapes[parent_index]
             axis = 1 if rng.random() < front_back_share else rng.choice((0, 2))
             side = rng.choice((-1, 1))
             new_min = [0.0, 0.0, 0.0]
@@ -635,6 +784,23 @@ def assemble_touching(
                 new_min[axis_index] + size[axis_index]
                 for axis_index in range(3)
             )
+            shape = _make_shape(kind, candidate)
+
+            if shape[0] != "box" or parent_shape[0] != "box":
+                direction = -side
+                travel = (parent[axis + 3] - parent[axis]) + size[axis]
+                shift = _slide_to_contact(
+                    kind, candidate, parent_shape, axis, direction, travel
+                )
+                if shift is None:
+                    continue
+                new_min[axis] += direction * shift
+                candidate = tuple(new_min) + tuple(
+                    new_min[axis_index] + size[axis_index]
+                    for axis_index in range(3)
+                )
+                shape = _make_shape(kind, candidate)
+
             outside_frame = any(
                 limit > 0
                 and (
@@ -652,18 +818,24 @@ def assemble_touching(
                     and other[coordinate] < candidate[coordinate + 3] - 0.001
                     for coordinate in range(3)
                 )
-                for other in placed_boxes
+                and _separation(shape, other_shape) < -0.001
+                for other, other_shape in zip(placed_boxes, placed_shapes)
             )
-            if not overlaps:
-                contacts = _count_contacts(candidate, placed_boxes)
-                required = min(min_contacts, len(placed_boxes))
-                if contacts < required:
-                    continue
-                moved = move_brep(element, new_min[0], new_min[1], new_min[2])
-                placed.append(moved)
-                placed_kinds.append(kind)
-                placed_boxes.append(candidate)
-                break
+            if overlaps:
+                continue
+
+            contacts = _count_contacts(
+                candidate, shape, placed_boxes, placed_shapes
+            )
+            if contacts < min(min_contacts, len(placed_boxes)):
+                continue
+
+            moved = move_brep(element, new_min[0], new_min[1], new_min[2])
+            placed.append(moved)
+            placed_kinds.append(kind)
+            placed_boxes.append(candidate)
+            placed_shapes.append(shape)
+            break
 
     return placed, placed_kinds
 
