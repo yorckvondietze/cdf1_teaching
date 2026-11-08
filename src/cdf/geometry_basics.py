@@ -393,6 +393,7 @@ def create_element_sizes(
     ring_span=3,
     ball_size=0.4,
     slenderness=0.8,
+    stick_share=0.2,
 ):
     """
     Create a list of element size settings.
@@ -403,11 +404,21 @@ def create_element_sizes(
     ring_span : int -- ring span
     ball_size : float -- ball size
     slenderness : float -- shape from chunky (0) to slender (1)
+    stick_share : float -- share of bars that become very thin sticks
 
-    Returns the settings in plate, bar, disc, ring, ball, and slenderness order.
+    Returns the settings in plate, bar, disc, ring, ball, slenderness, and stick_share order.
     """
     slenderness = min(1.0, max(0.0, float(slenderness)))
-    return [plate_span, bar_span, disc_span, ring_span, ball_size, slenderness]
+    stick_share = min(1.0, max(0.0, float(stick_share)))
+    return [
+        plate_span,
+        bar_span,
+        disc_span,
+        ring_span,
+        ball_size,
+        slenderness,
+        stick_share,
+    ]
 
 
 def create_element(kind, rng, module=10.0, sizes=None):
@@ -417,8 +428,9 @@ def create_element(kind, rng, module=10.0, sizes=None):
     kind : str -- element kind: "bar", "disc", "ring", "ball", or "plate"
     rng : random.Random -- random number generator
     module : float -- base length of the design, all element sizes are multiples of it
-    sizes : list -- settings ordered as plate, bar, disc, ring, ball, and slenderness
-                   (sizes[5]: 0 = chunky, 1 = slender)
+    sizes : list -- settings ordered as plate, bar, disc, ring, ball,
+                   slenderness (sizes[5]), and stick_share (sizes[6]),
+                   the share of bars that become very thin sticks
 
     Returns a Rhino.Geometry.Brep.
     """
@@ -433,23 +445,23 @@ def create_element(kind, rng, module=10.0, sizes=None):
     ring_span = int(sizes[3])
     ball_size = float(sizes[4])
     slenderness = min(1.0, max(0.0, float(sizes[5]))) if len(sizes) > 5 else 0.8
+    stick_share = min(1.0, max(0.0, float(sizes[6]))) if len(sizes) > 6 else 0.0
     origin = rg.Point3d(0, 0, 0)
 
     if kind == "bar":
-        if rng.random() < 0.7:
-            length = rng.randint(2, bar_span) * module
-            thickness = rng.uniform(
-                module * (0.8 - 0.65 * slenderness),
-                module * (1.6 - 1.15 * slenderness),
-            )
+        vertical = rng.random() < 0.7
+        length = rng.randint(2, bar_span) * module
+        stick_roll = rng.random()
+        stick_size = rng.random()
+        thickness = rng.uniform(
+            module * (0.8 - 0.65 * slenderness),
+            module * (1.6 - 1.15 * slenderness),
+        )
+        if stick_roll < stick_share:
+            thickness = module * (0.03 + 0.05 * stick_size)
+        if vertical:
             return create_box(origin, thickness, thickness, length)
-        else:
-            length = rng.randint(2, bar_span) * module
-            thickness = rng.uniform(
-                module * (0.8 - 0.65 * slenderness),
-                module * (1.6 - 1.15 * slenderness),
-            )
-            return create_box(origin, length, thickness, thickness)
+        return create_box(origin, length, thickness, thickness)
     if kind == "disc":
         radius = rng.randint(1, disc_span) * module / 2.0
         height = module * (1.0 - 0.8 * slenderness)
