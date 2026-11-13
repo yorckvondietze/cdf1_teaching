@@ -18,6 +18,551 @@ import math
 import Rhino.Geometry as rg
 import random
 
+def fibonacci_row_lengths(base_chain=8, rows_up=3, rows_down=3):
+    """Return the stitch count for each row in a Fibonacci-shaped sequence.
+
+    Params:
+        base_chain (int): Starting stitch count, rounded up to a Fibonacci
+            number if needed. Default 8.
+        rows_up (int): Number of rows to increase from the base. Default 3.
+        rows_down (int): Number of rows to decrease after the increase,
+            capped at rows_up. Default 3.
+
+    Returns:
+        list of int: stitches per row, e.g. [8, 13, 21, 34, 21, 13, 8].
+    """
+    fibonacci = [1, 2]
+    while fibonacci[-1] < base_chain:
+        fibonacci.append(fibonacci[-1] + fibonacci[-2])
+
+    base_index = next(
+        index for index, count in enumerate(fibonacci) if count >= base_chain
+    )
+    peak_index = base_index + rows_up
+    while len(fibonacci) <= peak_index:
+        fibonacci.append(fibonacci[-1] + fibonacci[-2])
+
+    row_lengths = fibonacci[base_index : peak_index + 1]
+    for offset in range(1, min(rows_down, rows_up) + 1):
+        row_lengths.append(fibonacci[peak_index - offset])
+
+    return row_lengths
+
+
+def even_stitch_pattern(current, target):
+    """Spread increases or decreases evenly along a row.
+
+    Returns a list with one number per stitch of the current row: how many
+    stitches it produces in the next row.
+        2 = increase (two new stitches into this stitch)
+        1 = normal stitch
+        0 = second stitch of a decrease pair (the first one of the pair
+            has a 1, together the two stitches make one new stitch)
+    The numbers always add up to target.
+    """
+    pattern = [1] * current
+    diff = target - current
+
+    if diff > current:
+        raise ValueError("Cannot more than double a row.")
+    if -diff * 2 > current:
+        raise ValueError("Cannot decrease more than half a row.")
+
+    if diff > 0:
+        for k in range(diff):
+            pattern[int((k + 0.5) * current / diff)] = 2
+    elif diff < 0:
+        pairs = -diff
+        for k in range(pairs):
+            start = int(k * current / pairs)
+            pattern[start + 1] = 0
+    return pattern
+
+
+def place_fibonacci_stitches(base_chain=8, rows_up=3, rows_down=3,
+                             stitch_width=1.0, stitch_height=2.0):
+    """Place every stitch of the Fibonacci up-and-down piece as a point.
+
+    Rows hang downwards (negative Z). Each stitch sits below its parent;
+    stitches of an increase share the parent's width, a decrease sits
+    between its two parents. Nothing is relaxed yet, so rows with more
+    stitches are still squeezed into the width of the row above.
+
+    Returns:
+        rows    -- list of rows, each a list of Rhino.Geometry.Point3d
+        parents -- same shape; for each stitch the list of parent indices
+                   in the row above (1 parent, or 2 for a decrease)
+    """
+    lengths = fibonacci_row_lengths(base_chain, rows_up, rows_down)
+
+    # row 0: the chain, a straight line of stitches
+    rows = [[rg.Point3d(i * stitch_width, 0.0, 0.0) for i in range(lengths[0])]]
+    parents = [[[] for _ in range(lengths[0])]]
+
+    for r in range(1, len(lengths)):
+        prev = rows[r - 1]
+        pattern = even_stitch_pattern(len(prev), lengths[r])
+        z = -r * stitch_height
+        new_row, new_parents = [], []
+
+        for i, count in enumerate(pattern):
+            p = prev[i]
+            if count == 2:  # increase: two stitches into one
+                for dx in (-0.25, 0.25):
+                    new_row.append(rg.Point3d(p.X + dx * stitch_width, 0.0, z))
+                    new_parents.append([i])
+            elif count == 1 and i + 1 < len(pattern) and pattern[i + 1] == 0:
+                q = prev[i + 1]  # decrease: two stitches into one
+                new_row.append(rg.Point3d((p.X + q.X) / 2.0, 0.0, z))
+                new_parents.append([i, i + 1])
+            elif count == 1:  # normal stitch
+                new_row.append(rg.Point3d(p.X, 0.0, z))
+                new_parents.append([i])
+            # count == 0: already used by the decrease before it
+
+        rows.append(new_row)
+        parents.append(new_parents)
+
+    return rows, parents
+
+
+def place_fibonacci_ring(base_chain=8, rows_up=3, rows_down=3,
+                         stitch_width=1.0, stitch_height=2.0):
+    """Place every stitch of the Fibonacci up-and-down piece worked in rounds.
+
+    Same recipe as place_fibonacci_stitches, but every row is a closed ring:
+    the starting chain is joined into a ring (the opening, at z = 0) and the
+    rounds hang below it. Growing rounds flare out, shrinking rounds close the
+    piece again, like a vase or a pod. Nothing is relaxed yet.
+
+    Returns:
+        rows    -- list of rounds, each a list of Rhino.Geometry.Point3d
+        parents -- same shape; for each stitch the list of parent indices
+                   in the round above (1 parent, or 2 for a decrease)
+    """
+    lengths = fibonacci_row_lengths(base_chain, rows_up, rows_down)
+
+    def point(angle, radius, z):
+        return rg.Point3d(radius * math.cos(angle), radius * math.sin(angle), z)
+
+    # round 0: the chain joined into a ring, one stitch_width per stitch
+    n0 = lengths[0]
+    radius0 = n0 * stitch_width / (2.0 * math.pi)
+    angles = [[2.0 * math.pi * i / n0 for i in range(n0)]]
+    radii = [[radius0] * n0]
+    rows = [[point(a, radius0, 0.0) for a in angles[0]]]
+    parents = [[[] for _ in range(n0)]]
+
+    for r in range(1, len(lengths)):
+        prev_n = lengths[r - 1]
+        step = 2.0 * math.pi / prev_n
+        pattern = even_stitch_pattern(prev_n, lengths[r])
+        z = -r * stitch_height
+        new_angles, new_radii, new_parents = [], [], []
+
+        for i, count in enumerate(pattern):
+            a, rad = angles[r - 1][i], radii[r - 1][i]
+            if count == 2:  # increase: two stitches into one
+                for da in (-0.25, 0.25):
+                    new_angles.append(a + da * step)
+                    new_radii.append(rad)
+                    new_parents.append([i])
+            elif count == 1 and i + 1 < prev_n and pattern[i + 1] == 0:
+                # decrease: two stitches into one, sits between its parents
+                new_angles.append(a + 0.5 * step)
+                new_radii.append(rad)
+                new_parents.append([i, i + 1])
+            elif count == 1:  # normal stitch
+                new_angles.append(a)
+                new_radii.append(rad)
+                new_parents.append([i])
+            # count == 0: already used by the decrease before it
+
+        angles.append(new_angles)
+        radii.append(new_radii)
+        rows.append([point(a, rad, z) for a, rad in zip(new_angles, new_radii)])
+        parents.append(new_parents)
+
+    return rows, parents
+
+
+def relax_fibonacci_stitches(rows, parents, stitch_width=1.0, stitch_height=2.0,
+                             iterations=200, jitter=0.3, smoothing=0.1,
+                             gravity=0.0, seed=1, closed=False, collision=0.0):
+    """Let the stitches settle like springs, so the piece ruffles.
+
+    Takes the output of place_fibonacci_stitches. The chain (row 0) is the
+    hanging line and stays fixed. Every stitch is pulled towards the right
+    distance from its parent (stitch_height) and from its neighbours in the
+    row (stitch_width). Rows with more stitches than room have to buckle.
+
+    Params:
+        rows, parents: from place_fibonacci_stitches.
+        iterations (int): Relaxation steps. 0 = no change. Default 200.
+        jitter (float): Random nudge (in stitch widths) that lets the flat
+            layout buckle. Default 0.3.
+        smoothing (float): Fabric stiffness, 0 to about 0.3. Pulls each
+            stitch towards the middle of its neighbours so creases become
+            smoother folds. Higher values squeeze stitches a bit more.
+            Default 0.1.
+        gravity (float): Pull downwards per step, 0 to about 0.1. Makes the
+            piece hang longer. Default 0.
+        seed (int): Same seed gives the same shape, another seed gives another
+            fold pattern. Default 1.
+        closed (bool): True when every row is a closed ring (use with
+            place_fibonacci_ring), so the last stitch of a row is also a
+            neighbour of the first. Default False.
+        collision (float): Thickness of the fabric in stitch widths, 0 to
+            about 1. Stitches that are not worked into each other cannot get
+            closer than this, so folds press against each other instead of
+            passing through each other. 0 switches it off. Default 0.
+
+    Returns:
+        List of rows, each a list of Rhino.Geometry.Point3d.
+    """
+    rng = random.Random(seed)
+
+    # flatten: one entry per stitch, remember where each row starts
+    points, fixed, start = [], [], []
+    for r, row in enumerate(rows):
+        start.append(len(points))
+        for p in row:
+            points.append([p.X, p.Y, p.Z])
+            fixed.append(r == 0)  # the chain is the hanging line, it stays put
+
+    # springs: (i, j, rest_length, stiffness)
+    springs = []
+    neighbours = [[] for _ in points]  # for smoothing: who touches whom
+    for r in range(1, len(rows)):
+        for k, plist in enumerate(parents[r]):
+            child = start[r] + k
+            for pi in plist:  # post: stitch to the stitch it is worked into
+                parent = start[r - 1] + pi
+                springs.append((parent, child, stitch_height, 1.0))
+                neighbours[child].append(parent)
+                neighbours[parent].append(child)
+    for r in range(1, len(rows)):
+        n = len(rows[r])
+        pairs = n if closed else n - 1  # a closed ring also joins last to first
+        for k in range(pairs):  # neighbours in a row, one stitch wide
+            a, b = start[r] + k, start[r] + (k + 1) % n
+            springs.append((a, b, stitch_width, 1.0))
+            neighbours[a].append(b)
+            neighbours[b].append(a)
+        skips = (n if n > 4 else 0) if closed else n - 2
+        for k in range(skips):  # weak spring over one stitch keeps it smooth
+            springs.append((start[r] + k, start[r] + (k + 2) % n, 2.0 * stitch_width, 0.15))
+
+    # stitches that are joined by a spring never collide with each other
+    linked = set((min(i, j), max(i, j)) for i, j, _, _ in springs)
+    collision_distance = collision * stitch_width
+
+    # small random nudge so the flat layout can buckle
+    for i, p in enumerate(points):
+        if not fixed[i]:
+            p[0] += rng.uniform(-jitter, jitter) * stitch_width
+            p[1] += rng.uniform(-jitter, jitter) * stitch_width
+            p[2] += rng.uniform(-jitter, jitter) * stitch_width
+
+    for _ in range(iterations):
+        for i, j, rest, stiffness in springs:
+            a, b = points[i], points[j]
+            dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+            length = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if length < 1e-9:
+                continue
+            move = 0.5 * stiffness * (length - rest) / length
+            if fixed[i] and fixed[j]:
+                continue
+            if fixed[i]:
+                f_a, f_b = 0.0, 2.0
+            elif fixed[j]:
+                f_a, f_b = 2.0, 0.0
+            else:
+                f_a, f_b = 1.0, 1.0
+            a[0] += dx * move * f_a; a[1] += dy * move * f_a; a[2] += dz * move * f_a
+            b[0] -= dx * move * f_b; b[1] -= dy * move * f_b; b[2] -= dz * move * f_b
+
+        # collision: stitches that are not worked into each other keep their
+        # distance, so the fabric cannot pass through itself
+        if collision_distance > 0.0:
+            cell = collision_distance
+            grid = {}
+            for index, p in enumerate(points):
+                key = (int(math.floor(p[0] / cell)),
+                       int(math.floor(p[1] / cell)),
+                       int(math.floor(p[2] / cell)))
+                grid.setdefault(key, []).append(index)
+            for (cx, cy, cz), members in grid.items():
+                for ox in (-1, 0, 1):
+                    for oy in (-1, 0, 1):
+                        for oz in (-1, 0, 1):
+                            others = grid.get((cx + ox, cy + oy, cz + oz))
+                            if not others:
+                                continue
+                            for i in members:
+                                for j in others:
+                                    if j <= i or (fixed[i] and fixed[j]):
+                                        continue
+                                    if (i, j) in linked:
+                                        continue
+                                    a, b = points[i], points[j]
+                                    dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+                                    d2 = dx * dx + dy * dy + dz * dz
+                                    if d2 >= cell * cell or d2 < 1e-12:
+                                        continue
+                                    dist = math.sqrt(d2)
+                                    push = 0.5 * (cell - dist) / dist
+                                    if fixed[i]:
+                                        f_a, f_b = 0.0, 2.0
+                                    elif fixed[j]:
+                                        f_a, f_b = 2.0, 0.0
+                                    else:
+                                        f_a, f_b = 1.0, 1.0
+                                    a[0] -= dx * push * f_a; a[1] -= dy * push * f_a; a[2] -= dz * push * f_a
+                                    b[0] += dx * push * f_b; b[1] += dy * push * f_b; b[2] += dz * push * f_b
+
+        # gravity: every free stitch is pulled down a little each step
+        if gravity > 0.0:
+            for i, p in enumerate(points):
+                if not fixed[i]:
+                    p[2] -= gravity
+
+        # fabric stiffness: pull every stitch a little towards the middle of
+        # its neighbours, so sharp creases turn into smoother folds
+        if smoothing > 0.0:
+            moved = [p[:] for p in points]
+            for i, p in enumerate(points):
+                if fixed[i] or not neighbours[i]:
+                    continue
+                for axis in range(3):
+                    mean = sum(points[j][axis] for j in neighbours[i]) / len(neighbours[i])
+                    moved[i][axis] = p[axis] + smoothing * (mean - p[axis])
+            points[:] = moved
+
+    return [[rg.Point3d(*points[start[r] + k]) for k in range(len(row))]
+            for r, row in enumerate(rows)]
+
+
+def loop_subdivide(vertices, faces, levels=1):
+    """Smooth a triangle mesh with Loop subdivision (every triangle becomes 4).
+
+    Params:
+        vertices (list): (x, y, z) tuples.
+        faces (list): (a, b, c) vertex indices.
+        levels (int): Number of subdivision rounds. Default 1.
+
+    Returns:
+        (vertices, faces) of the smoothed mesh.
+    """
+    for _ in range(levels):
+        count = len(vertices)
+        edge_opposite = {}
+        for a, b, c in faces:
+            for u, v, w in ((a, b, c), (b, c, a), (c, a, b)):
+                edge_opposite.setdefault((min(u, v), max(u, v)), []).append(w)
+        neighbours = [set() for _ in range(count)]
+        boundary = [[] for _ in range(count)]
+        for (u, v), opposite in edge_opposite.items():
+            neighbours[u].add(v)
+            neighbours[v].add(u)
+            if len(opposite) == 1:  # open edge of the mesh
+                boundary[u].append(v)
+                boundary[v].append(u)
+
+        # moved old vertices
+        new_vertices = []
+        for i in range(count):
+            v = vertices[i]
+            if len(boundary[i]) >= 2:  # on the open edge: stay on the edge
+                b1, b2 = vertices[boundary[i][0]], vertices[boundary[i][1]]
+                new_vertices.append(tuple(
+                    0.75 * v[k] + 0.125 * (b1[k] + b2[k]) for k in range(3)))
+                continue
+            n = len(neighbours[i])
+            if n < 3:
+                new_vertices.append(v)
+                continue
+            beta = (0.625 - (0.375 + 0.25 * math.cos(2.0 * math.pi / n)) ** 2) / n
+            total = [sum(vertices[j][k] for j in neighbours[i]) for k in range(3)]
+            new_vertices.append(tuple(
+                (1.0 - n * beta) * v[k] + beta * total[k] for k in range(3)))
+
+        # one new vertex in the middle of every edge
+        middle = {}
+        for (u, v), opposite in edge_opposite.items():
+            if len(opposite) == 2:
+                c, d = opposite
+                p = tuple(0.375 * (vertices[u][k] + vertices[v][k])
+                          + 0.125 * (vertices[c][k] + vertices[d][k]) for k in range(3))
+            else:
+                p = tuple(0.5 * (vertices[u][k] + vertices[v][k]) for k in range(3))
+            middle[(u, v)] = len(new_vertices)
+            new_vertices.append(p)
+
+        new_faces = []
+        for a, b, c in faces:
+            ab = middle[(min(a, b), max(a, b))]
+            bc = middle[(min(b, c), max(b, c))]
+            ca = middle[(min(c, a), max(c, a))]
+            new_faces += [(a, ab, ca), (b, bc, ab), (c, ca, bc), (ab, bc, ca)]
+        vertices, faces = new_vertices, new_faces
+    return vertices, faces
+
+
+def build_stitch_mesh(rows, parents, closed=False, cap=False, smooth=0):
+    """Connect the stitch points into a triangle mesh (the crochet fabric).
+
+    Every pair of neighbouring stitches in a row is joined to the stitch(es)
+    they were worked into in the row above. A decrease stitch, which is worked
+    into two stitches, also gets the triangle between its two parents.
+
+    Params:
+        closed (bool): True when every row is a closed ring (the last stitch
+            is joined to the first). Default False.
+        cap (bool): Only with closed rows: pull the last round shut with a
+            fan of triangles to one centre point. Default False.
+        smooth (int): Rounds of Loop subdivision, 0 to 2. Each round makes the
+            surface smoother and 4 times as heavy. Default 0.
+
+    Returns:
+        Rhino.Geometry.Mesh
+    """
+    vertices, faces, start = [], [], []
+    for row in rows:
+        start.append(len(vertices))
+        for p in row:
+            vertices.append((p.X, p.Y, p.Z))
+
+    for r in range(1, len(rows)):
+        n = len(rows[r])
+        for k in range(n):
+            child = start[r] + k
+            plist = parents[r][k]
+            # a decrease stitch is worked into two stitches: close the triangle
+            if len(plist) == 2:
+                faces.append((start[r - 1] + plist[0], child, start[r - 1] + plist[1]))
+            if k < n - 1 or closed:
+                nxt = (k + 1) % n
+                c1 = start[r] + nxt
+                p0 = start[r - 1] + plist[-1]
+                p1 = start[r - 1] + parents[r][nxt][0]
+                faces.append((p0, child, c1))
+                if p1 != p0:
+                    faces.append((p0, c1, p1))
+
+    if closed and cap and len(rows) > 1:
+        last = rows[-1]
+        centre = len(vertices)
+        vertices.append((sum(p.X for p in last) / len(last),
+                         sum(p.Y for p in last) / len(last),
+                         sum(p.Z for p in last) / len(last)))
+        for k in range(len(last)):
+            faces.append((start[-1] + k, centre, start[-1] + (k + 1) % len(last)))
+
+    if smooth > 0:
+        vertices, faces = loop_subdivide(vertices, faces, min(smooth, 2))
+
+    mesh = rg.Mesh()
+    for x, y, z in vertices:
+        mesh.Vertices.Add(x, y, z)
+    for a, b, c in faces:
+        mesh.Faces.AddFace(a, b, c)
+    mesh.Normals.ComputeNormals()
+    mesh.Compact()
+    return mesh
+
+def write_crochet_pattern(base_chain=8, rows_up=4, rows_down=4, stitch_type=1):
+    """Write the crochet pattern of the Fibonacci pod as pseudocode.
+
+    The text follows the style of the course README (PROCEDURE, CALL, FOR,
+    // comments), so it can be crocheted stitch by stitch. It uses the same
+    row lengths and the same evenly spread increases and decreases as the
+    model.
+
+    Params:
+        base_chain (int): Foundation chain, rounded up to a Fibonacci number.
+        rows_up (int): Rounds that grow. Default 4.
+        rows_down (int): Rounds that shrink again. Default 4.
+        stitch_type (int): 1 = single, 2 = double, 3 = treble crochet.
+
+    Returns:
+        str: the pattern, one line per row of text.
+    """
+    lengths = fibonacci_row_lengths(base_chain, rows_up, rows_down)
+    name = {1: "single", 2: "double", 3: "treble"}[stitch_type]
+    work = name + "_crochet_to_stitch()"
+    together = name + "_crochet_two_together()"
+    down = min(rows_down, rows_up)
+
+    lines = []
+    add = lines.append
+    add("PROCEDURE CrochetFibonacciPod(base_chain_stitch_count=%d, rounds_up=%d, "
+        "rounds_down=%d, stitch=%s)" % (lengths[0], rows_up, down, name))
+    add("")
+    add("    // Fibonacci rule: every round adds as many stitches as the round before")
+    add("    // it had. After the biggest round the rounds shrink again.")
+    add("    // Stitches per round: " + ", ".join(str(n) for n in lengths))
+    add("")
+    add("    // 1. Start and make a base line")
+    add("    current_layer = 0")
+    add("    CALL make_a_starting_slipknot() // go to video for instructions")
+    add("")
+    add("    FOR index = 1 TO base_chain_stitch_count")
+    add("        CALL make_a_chain_stitch() // go to video for instructions")
+    add("    END FOR")
+    add("")
+    add("    // 2. Join to the first stitch to make a ring")
+    add("    CALL make_a_slipstitch_to_first_chain() // go to video for instructions")
+    add("    current_stitches_in_round = %d" % lengths[0])
+    add("")
+    add("    // 3. Fibonacci rounds in spiral, work into the stitches of the round before")
+
+    for r in range(1, len(lengths)):
+        current, target = lengths[r - 1], lengths[r]
+        pattern = even_stitch_pattern(current, target)
+        add("")
+        if target > current:
+            where = [i + 1 for i, c in enumerate(pattern) if c == 2]
+            add("    // Round %d: %d -> %d stitches (%d increases)"
+                % (r, current, target, len(where)))
+            add("    increase_in_stitches = [" + ", ".join(str(s) for s in where) + "]")
+            add("    FOR s = 1 TO current_stitches_in_round")
+            add("        IF s IN increase_in_stitches")
+            add("            FOR k = 1 TO 2")
+            add("                CALL %s // go to video for instructions" % work)
+            add("            END FOR")
+            add("        ELSE")
+            add("            CALL %s // go to video for instructions" % work)
+            add("        END IF")
+            add("    END FOR")
+        else:
+            pairs = [(i + 1, i + 2) for i, c in enumerate(pattern)
+                     if c == 1 and i + 1 < current and pattern[i + 1] == 0]
+            add("    // Round %d: %d -> %d stitches (%d decreases)"
+                % (r, current, target, len(pairs)))
+            add("    decrease_over_stitches = ["
+                + ", ".join("(%d, %d)" % p for p in pairs) + "]")
+            add("    s = 1")
+            add("    WHILE s <= current_stitches_in_round")
+            add("        IF (s, s + 1) IN decrease_over_stitches")
+            add("            CALL %s // two stitches into one, not in the videos" % together)
+            add("            s = s + 2")
+            add("        ELSE")
+            add("            CALL %s // go to video for instructions" % work)
+            add("            s = s + 1")
+            add("        END IF")
+            add("    END WHILE")
+        add("    current_stitches_in_round = %d" % target)
+        add("    current_layer = current_layer + 1")
+
+    add("")
+    add("    // 4. Close the pod: pull the yarn through the last round and tighten")
+    add("    CALL finish_pattern() // go to video for instructions")
+    add("")
+    add("END PROCEDURE")
+    return "\n".join(lines)
+
 def create_fractal_tree(
     base_point=None,
     base_plane=None,
