@@ -472,6 +472,7 @@ def build_stitch_mesh(rows, parents, closed=False, cap=False, smooth=0):
     mesh.Compact()
     return mesh
 
+
 def write_crochet_pattern(base_chain=8, rows_up=4, rows_down=4, stitch_type=1):
     """Write the crochet pattern of the Fibonacci pod as pseudocode.
 
@@ -557,7 +558,10 @@ def write_crochet_pattern(base_chain=8, rows_up=4, rows_down=4, stitch_type=1):
         add("    current_layer = current_layer + 1")
 
     add("")
-    add("    // 4. Close the pod: pull the yarn through the last round and tighten")
+    if down > 0:
+        add("    // 4. Close the pod: pull the yarn through the last round and tighten")
+    else:
+        add("    // 4. Leave the last round open and fasten off")
     add("    CALL finish_pattern() // go to video for instructions")
     add("")
     add("END PROCEDURE")
@@ -1116,3 +1120,283 @@ def grow_tangent_spheres(
     tip_points = [pt for (pt, d, r) in tips]
 
     return spheres, lines, tip_points
+
+import System.Drawing as sd
+
+
+# ======================================================================
+# Constructivist floor: two tiles (A and B) and a rule that places them
+# ======================================================================
+
+# colours of the floor palette (index 0 to 7)
+FLOOR_PALETTE = (
+    (225, 215, 190),  # 0 paper
+    (25, 22, 22),     # 1 black
+    (150, 60, 40),    # 2 rust
+    (215, 175, 70),   # 3 ochre
+    (70, 80, 85),     # 4 slate
+    (80, 55, 45),     # 5 brown
+    (107, 112, 55),   # 6 olive
+    (36, 72, 54),     # 7 dark green
+)
+
+
+def make_tile(lines=1, center=0, center_size=0.2, center_color=3,
+              corner=0, corner_size=0.2, corner_color=2):
+    """Describe one tile type.
+
+    lines: 0 none, 1 bars cross, 2 curves.
+    center: 0 none, 1 circle, 2 ring (in the middle of the tile).
+    center_size: radius of the centre form as a fraction of the tile.
+    center_color: palette index (0 to 7) of the centre form.
+    corner: 0 none, 1 circle, 2 ring, 3 rectangle (a quarter of it in each tile corner).
+    corner_size: radius (or half side) of the corner form as a fraction of the tile.
+    corner_color: palette index (0 to 7) of the corner form.
+    """
+    return dict(lines=int(lines), center=int(center), center_size=float(center_size),
+                center_color=int(center_color), corner=int(corner),
+                corner_size=float(corner_size), corner_color=int(corner_color))
+
+
+def pack_tile(lines, center, center_size, center_color, corner, corner_size, corner_color):
+    """A tile as a plain list of 7 numbers, so it can travel along a Grasshopper wire."""
+    return [lines, center, center_size, center_color, corner, corner_size, corner_color]
+
+
+def unpack_tile(values):
+    """The tile dict again, from the list made by pack_tile (or a tile dict)."""
+    if isinstance(values, dict):
+        return values
+    return make_tile(*values)
+
+
+def _line(p, q):
+    return ("L", p, q)
+
+
+def _arc(p, m, q):
+    return ("A", p, m, q)
+
+
+def _circle_loop(cx, cy, r):
+    return [("C", (cx, cy), r)]
+
+
+def _square_loop(cx, cy, half):
+    return [_line((cx - half, cy - half), (cx + half, cy - half)),
+            _line((cx + half, cy - half), (cx + half, cy + half)),
+            _line((cx + half, cy + half), (cx - half, cy + half)),
+            _line((cx - half, cy + half), (cx - half, cy - half))]
+
+
+def _cross_loop(x0, y0, x1, y1, t):
+    cx, cy, h = (x0 + x1) / 2.0, (y0 + y1) / 2.0, t / 2.0
+    pts = [(x0, cy - h), (cx - h, cy - h), (cx - h, y0), (cx + h, y0), (cx + h, cy - h),
+           (x1, cy - h), (x1, cy + h), (cx + h, cy + h), (cx + h, y1), (cx - h, y1),
+           (cx - h, cy + h), (x0, cy + h)]
+    return [_line(pts[k], pts[(k + 1) % len(pts)]) for k in range(len(pts))]
+
+
+def _quarter_annulus_loop(cx, cy, r_in, r_out, start_deg):
+    def pt(r, deg):
+        a = math.radians(deg)
+        return (cx + r * math.cos(a), cy + r * math.sin(a))
+    return [_line(pt(r_in, start_deg), pt(r_out, start_deg)),
+            _arc(pt(r_out, start_deg), pt(r_out, start_deg + 45), pt(r_out, start_deg + 90)),
+            _line(pt(r_out, start_deg + 90), pt(r_in, start_deg + 90)),
+            _arc(pt(r_in, start_deg + 90), pt(r_in, start_deg + 45), pt(r_in, start_deg))]
+
+
+def _form_regions(kind, cx, cy, size, negative, ring_ratio=0.38):
+    """Regions of one form centred at (cx, cy).
+
+    kind: 1 circle, 2 ring, 3 rectangle. A region is a list of loops: the
+    first is the outline, the others are holes.
+    Negative forms are a plate with the form cut out of it.
+    """
+    inner = size * (1.0 - ring_ratio)
+    if not negative:
+        if kind == 1:
+            return [[_circle_loop(cx, cy, size)]]
+        if kind == 2:
+            return [[_circle_loop(cx, cy, size), _circle_loop(cx, cy, inner)]]
+        return [[_square_loop(cx, cy, size)]]
+    plate = _square_loop(cx, cy, size * 1.3)
+    if kind == 1:
+        return [[plate, _circle_loop(cx, cy, size)]]
+    if kind == 2:
+        return [[plate, _circle_loop(cx, cy, size)], [_circle_loop(cx, cy, inner)]]
+    return [[plate, _square_loop(cx, cy, size)]]
+
+
+def parse_recipe(text, default):
+    """A recipe is four letters A or B, read as a 2 x 2 block: 1 2 on top, 3 4 below.
+
+    Anything else (nothing connected, wrong length) gives the default recipe.
+    """
+    letters = [ch for ch in str(text or "").upper() if ch in "AB"]
+    return letters if len(letters) == 4 else list(default)
+
+
+def substitute_floor(recipe_a="AAAB", recipe_b="BBBA", steps=3):
+    """The rule: start with one tile A and let every tile turn into four tiles.
+
+    Every step, all tiles are replaced at once, each by the recipe of its own
+    type. After `steps` steps the floor is 2**steps tiles wide and high.
+    The curves of tile A flip like a chessboard, so neighbouring curves close
+    into loops.
+
+    Returns (size, cells) with cells: (i, j) -> (tile name, orientation 0 or 1),
+    i going right and j going up.
+    """
+    recipes = {"A": parse_recipe(recipe_a, "AAAB"), "B": parse_recipe(recipe_b, "BBBA")}
+    steps = max(1, min(4, int(steps)))
+    cells = {(0, 0): "A"}
+    size = 1
+    for _ in range(steps):
+        grown = {}
+        for (i, j), tile in cells.items():
+            top_left, top_right, bottom_left, bottom_right = recipes[tile]
+            grown[(2 * i, 2 * j + 1)] = top_left
+            grown[(2 * i + 1, 2 * j + 1)] = top_right
+            grown[(2 * i, 2 * j)] = bottom_left
+            grown[(2 * i + 1, 2 * j)] = bottom_right
+        cells = grown
+        size *= 2
+    return size, {(i, j): (tile, (i + j) % 2) for (i, j), tile in cells.items()}
+
+
+def create_constructivist_floor_shapes(recipe_a="AAAB", recipe_b="BBBA", steps=3,
+                                       bar_width=0.14, negative=False,
+                                       tile_a=None, tile_b=None, color_lines=1):
+    """Build the floor as flat shapes (pure Python, tile size = 1).
+
+    The two recipes and the number of steps decide which tile goes where
+    (see substitute_floor). Both tiles share the bar width, so lines continue across every tile edge.
+    Corner forms belong to the vertex, not to a tile: the tile whose lower left
+    corner is the vertex decides the form, and all four tiles around it show it.
+    That keeps the corners seamless although A and B can have different corners.
+
+    Returns a list of shapes: dict(layer, color, regions).
+    layer 0 = ground, 1 = lines, 2 = forms.
+    """
+    if not tile_a:  # nothing connected: use the default tiles
+        tile_a = make_tile(2, 1, 0.20, 3, 1, 0.22, 2)
+    if not tile_b:
+        tile_b = make_tile(1, 2, 0.22, 4, 1, 0.22, 2)
+    tiles = {"A": unpack_tile(tile_a), "B": unpack_tile(tile_b)}
+    size, cells = substitute_floor(recipe_a, recipe_b, steps)
+    width = height = size
+    pal = FLOOR_PALETTE
+    t = bar_width
+    room = 0.5 - t / 2.0 - 0.03  # forms never touch the bar where it crosses a tile edge
+
+    shapes = [dict(layer=0, color=pal[0],
+                   regions=[[[_line((0, 0), (width, 0)), _line((width, 0), (width, height)),
+                              _line((width, height), (0, height)), _line((0, height), (0, 0))]]])]
+
+    # lines
+    for (i, j), (name, orient) in cells.items():
+        tile = tiles[name]
+        if tile["lines"] == 1:
+            shapes.append(dict(layer=1, color=pal[color_lines],
+                               regions=[[_cross_loop(i, j, i + 1, j + 1, t)]]))
+        elif tile["lines"] == 2:
+            if orient == 0:
+                centres = ((i, j, 0), (i + 1, j + 1, 180))
+            else:
+                centres = ((i + 1, j, 90), (i, j + 1, 270))
+            shapes.append(dict(layer=1, color=pal[color_lines],
+                               regions=[[_quarter_annulus_loop(cx, cy, 0.5 - t / 2.0, 0.5 + t / 2.0, a)]
+                                        for cx, cy, a in centres]))
+
+    # forms in the middle of every tile
+    for (i, j), (name, orient) in cells.items():
+        tile = tiles[name]
+        if tile["center"] == 0:
+            continue
+        size = min(tile["center_size"], (0.47 / 1.3) if negative else 0.47)
+        shapes.append(dict(layer=2, color=pal[tile["center_color"]],
+                           regions=_form_regions(tile["center"], i + 0.5, j + 0.5, size, negative)))
+
+    # forms on the inner grid corners, decided by the tile above and to the right
+    for vj in range(1, height):
+        for vi in range(1, width):
+            tile = tiles[cells[(vi, vj)][0]]
+            if tile["corner"] == 0:
+                continue
+            size = min(tile["corner_size"], (room / 1.3) if negative else room)
+            shapes.append(dict(layer=2, color=pal[tile["corner_color"]],
+                               regions=_form_regions(tile["corner"], vi, vj, size, negative)))
+    return shapes
+
+
+def _pt(p, z, module):
+    return rg.Point3d(p[0] * module, p[1] * module, z)
+
+
+def _loop_to_curve(loop, z, module):
+    """One closed outline (list of line, arc and circle pieces) as a Rhino curve."""
+    if len(loop) == 1 and loop[0][0] == "C":
+        (cx, cy), r = loop[0][1], loop[0][2]
+        plane = rg.Plane(rg.Point3d(cx * module, cy * module, z), rg.Vector3d.ZAxis)
+        return rg.Circle(plane, r * module).ToNurbsCurve()
+    poly = rg.PolyCurve()
+    for seg in loop:
+        if seg[0] == "L":
+            poly.Append(rg.Line(_pt(seg[1], z, module), _pt(seg[2], z, module)))
+        else:
+            poly.Append(rg.Arc(_pt(seg[1], z, module), _pt(seg[2], z, module),
+                               _pt(seg[3], z, module)))
+    return poly
+
+
+def floor_shapes_to_geometry(shapes, module=1.0, layer_height=0.002):
+    """Turn the flat shapes into planar Breps (with holes) and one colour per Brep.
+
+    module: size of one tile. layer_height: tiny height between the layers
+    (ground, lines, forms) so that overlapping shapes do not flicker.
+
+    Returns (breps, colors).
+    """
+    breps, colors = [], []
+    for shape in shapes:
+        z = shape["layer"] * layer_height * module
+        color = sd.Color.FromArgb(*shape["color"])
+        for region in shape["regions"]:
+            curves = [_loop_to_curve(loop, z, module) for loop in region]
+            made = rg.Brep.CreatePlanarBreps(curves, 0.001)
+            for brep in made or []:
+                breps.append(brep)
+                colors.append(color)
+    return breps, colors
+
+
+def colored_mesh(breps, colors):
+    """One mesh of all Breps with a vertex colour each, to show the floor in colour."""
+    joined = rg.Mesh()
+    params = rg.MeshingParameters.QualityRenderMesh
+    for brep, color in zip(breps, colors):
+        for mesh in rg.Mesh.CreateFromBrep(brep, params) or []:
+            mesh.VertexColors.CreateMonotoneMesh(color)
+            joined.Append(mesh)
+    return joined
+
+
+def create_constructivist_floor(recipe_a="AAAB", recipe_b="BBBA", steps=3,
+                                tile_a=None, tile_b=None, bar_width=0.14,
+                                negative=False, module=1.0, color_lines=1):
+    """The whole floor: shapes -> Breps, colours and one coloured mesh.
+
+    recipe_a, recipe_b: four letters each (A or B), what a tile turns into.
+    steps: how many times all tiles are replaced (1 to 4).
+    tile_a, tile_b: the two tiles, as made by pack_tile (a list of 7 numbers);
+    nothing connected uses the default tiles.
+    color_lines: palette index (0 to 7) of the lines.
+
+    Returns (breps, colors, mesh).
+    """
+    shapes = create_constructivist_floor_shapes(
+        recipe_a, recipe_b, steps, bar_width, negative, tile_a, tile_b, color_lines)
+    breps, colors = floor_shapes_to_geometry(shapes, module)
+    return breps, colors, colored_mesh(breps, colors)
