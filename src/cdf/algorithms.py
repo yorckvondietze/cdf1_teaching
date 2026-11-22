@@ -1400,3 +1400,307 @@ def create_constructivist_floor(recipe_a="AAAB", recipe_b="BBBA", steps=3,
         recipe_a, recipe_b, steps, bar_width, negative, tile_a, tile_b, color_lines)
     breps, colors = floor_shapes_to_geometry(shapes, module)
     return breps, colors, colored_mesh(breps, colors)
+
+def _derive_stitch_parents(rows):
+    """Work out which stitch of the round above each stitch is worked into.
+
+    Uses the same rule as place_fibonacci_stitches (even_stitch_pattern), so it
+    only needs the stitch counts of the rounds. Returns the same `parents`
+    structure as place_fibonacci_ring.
+    """
+    parents = [[[] for _ in rows[0]]]
+    for r in range(1, len(rows)):
+        pattern = even_stitch_pattern(len(rows[r - 1]), len(rows[r]))
+        new_parents = []
+        for i, count in enumerate(pattern):
+            if count == 2:
+                new_parents.extend([[i], [i]])
+            elif count == 1 and i + 1 < len(pattern) and pattern[i + 1] == 0:
+                new_parents.append([i, i + 1])
+            elif count == 1:
+                new_parents.append([i])
+        parents.append(new_parents)
+    return parents
+
+
+def create_stitch_boxes(rows, parents=None, box_scale=0.85, darken=0.45,
+                        closed=True):
+    """Build every stitch as a small box and colour it by type and round.
+
+    Each stitch gets its own local coordinate frame, built like in the
+    lecture with a cross product:
+        up      = from the stitch(es) it is worked into, to the stitch
+        along   = direction of the round (previous to next neighbour),
+                  made perpendicular to `up`
+        depth   = cross product of the two
+    The box is centred between the stitch and its parent, so the boxes stack
+    like bricks along the fabric.
+
+    Colours:
+        increase (2 stitches into one) = terracotta
+        decrease (2 stitches together)  = dark green
+        normal stitch                   = sage green
+    Every round is a bit darker than the one before.
+
+    Params:
+        rows: relaxed stitch points, list of rounds (Point3d).
+        parents: from place_fibonacci_ring. Optional, it is worked out from
+            the round lengths when left out.
+        box_scale (float): Box size relative to the stitch, below 1 leaves a
+            small gap between boxes. Default 0.85.
+        darken (float): How much darker the last round is than the first,
+            0 = no change, 0.45 = 45 percent darker. Default 0.45.
+        closed (bool): True when every round is a closed ring. Default True.
+
+    Returns:
+        boxes  -- list of Rhino.Geometry.Brep, one per stitch
+        colors -- list of System.Drawing.Color, same order
+        mesh   -- one Rhino.Geometry.Mesh of all boxes, with vertex colours
+    """
+    import System.Drawing as sd
+
+    if parents is None:
+        parents = _derive_stitch_parents(rows)
+
+    normal_rgb = (169, 183, 156)
+    increase_rgb = (196, 98, 59)
+    decrease_rgb = (47, 74, 51)
+
+    # how many children has every stitch? (2 children = it was an increase)
+    children = [[[] for _ in row] for row in rows]
+    for r in range(1, len(rows)):
+        for k, plist in enumerate(parents[r]):
+            for pi in plist:
+                children[r - 1][pi].append(k)
+
+    last = max(1, len(rows) - 1)
+    boxes, colors = [], []
+    mesh = rg.Mesh()
+    vertex_colors = []
+
+    for r, row in enumerate(rows):
+        n = len(row)
+        factor = 1.0 - darken * r / last
+        for k, p in enumerate(row):
+            # --- what kind of stitch is it? ---
+            if r > 0 and len(parents[r][k]) == 2:
+                rgb = decrease_rgb
+            elif r > 0 and len(children[r - 1][parents[r][k][0]]) == 2:
+                rgb = increase_rgb
+            else:
+                rgb = normal_rgb
+
+            # --- local frame ---
+            if r > 0:
+                anchors = [rows[r - 1][i] for i in parents[r][k]]
+            else:
+                anchors = [rows[1][i] for i in children[0][k]] if len(rows) > 1 else []
+            if r > 0:
+                base = rg.Point3d(sum(a.X for a in anchors) / len(anchors),
+                                  sum(a.Y for a in anchors) / len(anchors),
+                                  sum(a.Z for a in anchors) / len(anchors))
+                up = p - base
+            elif anchors:
+                tip = rg.Point3d(sum(a.X for a in anchors) / len(anchors),
+                                 sum(a.Y for a in anchors) / len(anchors),
+                                 sum(a.Z for a in anchors) / len(anchors))
+                up = tip - p
+                base = p
+            else:
+                base = p
+                up = rg.Vector3d(0, 0, -1)
+            height = up.Length
+            if height < 1e-9:
+                up = rg.Vector3d(0, 0, 1)
+                height = 1.0
+            up.Unitize()
+
+            if closed:
+                prev_p, next_p = row[(k - 1) % n], row[(k + 1) % n]
+            else:
+                prev_p, next_p = row[max(k - 1, 0)], row[min(k + 1, n - 1)]
+            along = next_p - prev_p
+            along = along - up * (along * up)  # make it perpendicular to up
+            if along.Length < 1e-9:
+                along = rg.Vector3d.CrossProduct(up, rg.Vector3d(0, 0, 1))
+            if along.Length < 1e-9:
+                along = rg.Vector3d(1, 0, 0)
+            along.Unitize()
+
+            width = 0.5 * (p.DistanceTo(prev_p) + p.DistanceTo(next_p))
+            if width < 1e-9:
+                width = height
+
+            # --- the box, centred between the stitch and its parent ---
+            if r > 0:
+                centre = rg.Point3d((p.X + base.X) / 2, (p.Y + base.Y) / 2, (p.Z + base.Z) / 2)
+            else:
+                centre = rg.Point3d(p.X + up.X * height / 2, p.Y + up.Y * height / 2,
+                                    p.Z + up.Z * height / 2)
+            plane = rg.Plane(centre, along, up)  # z axis = along x up (cross product)
+            w, h = width * box_scale / 2.0, height * box_scale / 2.0
+            box = rg.Box(plane, rg.Interval(-w, w), rg.Interval(-h, h), rg.Interval(-w, w))
+
+            color = sd.Color.FromArgb(int(rgb[0] * factor), int(rgb[1] * factor),
+                                      int(rgb[2] * factor))
+            boxes.append(box.ToBrep())
+            colors.append(color)
+
+            box_mesh = rg.Mesh.CreateFromBox(box, 1, 1, 1)
+            for _ in range(box_mesh.Vertices.Count):
+                vertex_colors.append(color)
+            mesh.Append(box_mesh)
+
+    mesh.VertexColors.Clear()
+    for c in vertex_colors:
+        mesh.VertexColors.Add(c)
+    mesh.Normals.ComputeNormals()
+    return boxes, colors, mesh
+
+def create_stitch_donuts(rows, parents=None, donut_scale=0.8, darken=0.45,
+                         closed=True, tube=0.3):
+    """Build every stitch as a small donut (torus) and colour it.
+
+    Same frames and colours as create_stitch_boxes: every stitch gets a local
+    coordinate frame (up = from its parent to the stitch, along = direction of
+    the round, depth = cross product of the two). The donut lies in the
+    (along, up) plane, so its hole looks out of the fabric like a yarn loop.
+    It is centred between the stitch and its parent.
+
+    Colours:
+        increase (2 stitches into one) = terracotta
+        decrease (2 stitches together)  = dark green
+        normal stitch                   = sage green
+    Every round is a bit darker than the one before.
+
+    Params:
+        rows: relaxed stitch points, list of rounds (Point3d).
+        parents: from place_fibonacci_ring. Optional, it is worked out from
+            the round lengths when left out.
+        donut_scale (float): Outer diameter of the donut relative to the
+            smaller of stitch width and height. Default 0.8.
+        darken (float): How much darker the last round is than the first,
+            0 = no change, 0.45 = 45 percent darker. Default 0.45.
+        closed (bool): True when every round is a closed ring. Default True.
+        tube (float): Thickness of the donut ring, 0.15 = thin, 0.45 = fat.
+            Default 0.3.
+
+    Returns:
+        donuts -- list of Rhino.Geometry.Brep, one per stitch
+        colors -- list of System.Drawing.Color, same order
+        mesh   -- one Rhino.Geometry.Mesh of all donuts, with vertex colours
+    """
+    import System.Drawing as sd
+
+    if parents is None:
+        parents = _derive_stitch_parents(rows)
+
+    normal_rgb = (169, 183, 156)
+    increase_rgb = (196, 98, 59)
+    decrease_rgb = (47, 74, 51)
+    u_steps, v_steps = 16, 8  # mesh resolution around and through the donut
+
+    children = [[[] for _ in row] for row in rows]
+    for r in range(1, len(rows)):
+        for k, plist in enumerate(parents[r]):
+            for pi in plist:
+                children[r - 1][pi].append(k)
+
+    last = max(1, len(rows) - 1)
+    donuts, colors = [], []
+    mesh = rg.Mesh()
+
+    for r, row in enumerate(rows):
+        n = len(row)
+        factor = 1.0 - darken * r / last
+        for k, p in enumerate(row):
+            # --- what kind of stitch is it? ---
+            if r > 0 and len(parents[r][k]) == 2:
+                rgb = decrease_rgb
+            elif r > 0 and len(children[r - 1][parents[r][k][0]]) == 2:
+                rgb = increase_rgb
+            else:
+                rgb = normal_rgb
+
+            # --- local frame (same as create_stitch_boxes) ---
+            if r > 0:
+                anchors = [rows[r - 1][i] for i in parents[r][k]]
+            else:
+                anchors = [rows[1][i] for i in children[0][k]] if len(rows) > 1 else []
+            if r > 0:
+                base = rg.Point3d(sum(a.X for a in anchors) / len(anchors),
+                                  sum(a.Y for a in anchors) / len(anchors),
+                                  sum(a.Z for a in anchors) / len(anchors))
+                up = p - base
+            elif anchors:
+                tip = rg.Point3d(sum(a.X for a in anchors) / len(anchors),
+                                 sum(a.Y for a in anchors) / len(anchors),
+                                 sum(a.Z for a in anchors) / len(anchors))
+                up = tip - p
+                base = p
+            else:
+                base = p
+                up = rg.Vector3d(0, 0, -1)
+            height = up.Length
+            if height < 1e-9:
+                up = rg.Vector3d(0, 0, 1)
+                height = 1.0
+            up.Unitize()
+
+            if closed:
+                prev_p, next_p = row[(k - 1) % n], row[(k + 1) % n]
+            else:
+                prev_p, next_p = row[max(k - 1, 0)], row[min(k + 1, n - 1)]
+            along = next_p - prev_p
+            along = along - up * (along * up)
+            if along.Length < 1e-9:
+                along = rg.Vector3d.CrossProduct(up, rg.Vector3d(0, 0, 1))
+            if along.Length < 1e-9:
+                along = rg.Vector3d(1, 0, 0)
+            along.Unitize()
+
+            width = 0.5 * (p.DistanceTo(prev_p) + p.DistanceTo(next_p))
+            if width < 1e-9:
+                width = height
+
+            if r > 0:
+                centre = rg.Point3d((p.X + base.X) / 2, (p.Y + base.Y) / 2, (p.Z + base.Z) / 2)
+            else:
+                centre = rg.Point3d(p.X + up.X * height / 2, p.Y + up.Y * height / 2,
+                                    p.Z + up.Z * height / 2)
+            plane = rg.Plane(centre, along, up)
+
+            # --- the donut: outer radius = half the scaled size ---
+            outer = min(width, height) * donut_scale / 2.0
+            minor = outer * tube
+            major = outer - minor
+            color = sd.Color.FromArgb(int(rgb[0] * factor), int(rgb[1] * factor),
+                                      int(rgb[2] * factor))
+            donuts.append(rg.Torus(plane, major, minor).ToRevSurface().ToBrep())
+            colors.append(color)
+
+            # mesh of the same donut, vertex by vertex
+            x_axis, y_axis, z_axis = plane.XAxis, plane.YAxis, plane.ZAxis
+            first = mesh.Vertices.Count
+            for i in range(u_steps):
+                u = 2.0 * math.pi * i / u_steps
+                ring_dir = x_axis * math.cos(u) + y_axis * math.sin(u)
+                for j in range(v_steps):
+                    v = 2.0 * math.pi * j / v_steps
+                    radial = major + minor * math.cos(v)
+                    mesh.Vertices.Add(
+                        centre.X + ring_dir.X * radial + z_axis.X * minor * math.sin(v),
+                        centre.Y + ring_dir.Y * radial + z_axis.Y * minor * math.sin(v),
+                        centre.Z + ring_dir.Z * radial + z_axis.Z * minor * math.sin(v))
+                    mesh.VertexColors.Add(color)
+            for i in range(u_steps):
+                for j in range(v_steps):
+                    a = first + i * v_steps + j
+                    b = first + i * v_steps + (j + 1) % v_steps
+                    c = first + ((i + 1) % u_steps) * v_steps + (j + 1) % v_steps
+                    d = first + ((i + 1) % u_steps) * v_steps + j
+                    mesh.Faces.AddFace(a, b, c, d)
+
+    mesh.Normals.ComputeNormals()
+    mesh.Compact()
+    return donuts, colors, mesh
