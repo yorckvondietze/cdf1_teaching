@@ -1558,7 +1558,8 @@ def create_stitch_boxes(rows, parents=None, box_scale=0.85, darken=0.45,
     return boxes, colors, mesh
 
 def create_stitch_donuts(rows, parents=None, donut_scale=0.8, darken=0.45,
-                         closed=True, tube=0.3):
+                         closed=True, tube=0.3, increase_size=0.7,
+                         decrease_size=1.2):
     """Build every stitch as a small donut (torus) and colour it.
 
     Same frames and colours as create_stitch_boxes: every stitch gets a local
@@ -1584,6 +1585,12 @@ def create_stitch_donuts(rows, parents=None, donut_scale=0.8, darken=0.45,
         closed (bool): True when every round is a closed ring. Default True.
         tube (float): Thickness of the donut ring, 0.15 = thin, 0.45 = fat.
             Default 0.3.
+        increase_size (float): Size of increase donuts compared to a normal
+            stitch. Two stitches share the room of one, so they are smaller.
+            Default 0.7, 1.0 = no change.
+        decrease_size (float): Size of decrease donuts compared to a normal
+            stitch. One stitch sits on two parents, so it is bigger.
+            Default 1.2, 1.0 = no change.
 
     Returns:
         donuts -- list of Rhino.Geometry.Brep, one per stitch
@@ -1617,10 +1624,13 @@ def create_stitch_donuts(rows, parents=None, donut_scale=0.8, darken=0.45,
             # --- what kind of stitch is it? ---
             if r > 0 and len(parents[r][k]) == 2:
                 rgb = decrease_rgb
+                type_size = decrease_size
             elif r > 0 and len(children[r - 1][parents[r][k][0]]) == 2:
                 rgb = increase_rgb
+                type_size = increase_size
             else:
                 rgb = normal_rgb
+                type_size = 1.0
 
             # --- local frame (same as create_stitch_boxes) ---
             if r > 0:
@@ -1670,8 +1680,8 @@ def create_stitch_donuts(rows, parents=None, donut_scale=0.8, darken=0.45,
                                     p.Z + up.Z * height / 2)
             plane = rg.Plane(centre, along, up)
 
-            # --- the donut: outer radius = half the scaled size ---
-            outer = min(width, height) * donut_scale / 2.0
+            # --- the donut: outer radius = half the scaled size, per stitch type ---
+            outer = min(width, height) * donut_scale * type_size / 2.0
             minor = outer * tube
             major = outer - minor
             color = sd.Color.FromArgb(int(rgb[0] * factor), int(rgb[1] * factor),
